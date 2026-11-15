@@ -22,7 +22,8 @@ The project aims to:
 The following Python packages are required:
 
 - `numpy`
-- `torch`
+- `scipy`
+- `torch` / `torchvision`
 - `ultralytics` (YOLOv8 model)
 - `deep-sort-realtime`
 - `opencv-python`
@@ -32,6 +33,12 @@ The following Python packages are required:
 To install the required dependencies, run:
 ```bash
 pip install -r requirements.txt
+```
+
+`torchreid` does not build reliably from PyPI on Python 3.12, so install it
+from source:
+```bash
+pip install git+https://github.com/KaiyangZhou/deep-person-reid.git
 ```
 
 ---
@@ -48,17 +55,27 @@ pip install -r requirements.txt
 
 ### Code Structure
 
-- **`yolo_model = YOLO("yolov8n.pt")`**: 
-  Loads the YOLOv8n model, which is used to detect objects (particularly persons) in the video frames.
-  
-- **DeepSORT Initialization**: 
-  The DeepSORT tracker is initialized to handle object tracking by associating bounding boxes across frames.
+- **`person_tracker.py`**:
+  The pipeline. Loads the detector and the re-ID model, runs the frame loop, and
+  draws the annotated output.
 
-- **OSNet for Person Re-identification**: 
-  OSNet is used to generate embeddings for each detected person. This allows the model to re-identify people after occlusions.
+- **`reid.py`**:
+  The identity gallery and box geometry. Deliberately depends on NumPy only, so
+  the matching logic can be tested without OpenCV or torch.
 
-- **Main Loop**: 
-  The code reads the video frame-by-frame, applies YOLO to detect persons, uses DeepSORT for tracking, and applies re-identification with OSNet to ensure consistent IDs throughout the video.
+- **`tests/`**:
+  Unit tests for identity matching, appearance averaging, and the box helpers.
+
+- **YOLOv8 detector**:
+  Runs once per frame with `classes=[0]`, so only people are decoded.
+
+- **DeepSORT tracker**:
+  Associates boxes across frames, using the OSNet features as its appearance
+  term instead of its own built-in embedder.
+
+- **OSNet re-identification**:
+  Produces one appearance vector per detected person. These feed both the
+  tracker's association step and the gallery that outlives a lost track.
 
 ---
 
@@ -87,49 +104,103 @@ pip install -r requirements.txt
 
 ### Running the Code
 
-To run the project:
-
-1. **Ensure you have the necessary video file**:
-   Place your video in the `test_videos` directory or adjust the path to point to your video file.
+1. **Ensure you have the video file**:
+   Place your video in the `test_videos` directory, or pass its path with
+   `--source`.
 
 2. **Run the script**:
    ```bash
-   python person_tracking.py
+   python person_tracker.py --source test_videos/your_video.mp4 --output output_person_tracking.mp4
    ```
 
 3. **View the output**:
-   The script will display the video with bounding boxes and unique IDs for each tracked person. It will also save the output video (`output_person_tracking.mp4`) to the current directory.
+   The script shows the video with a coloured box and an ID per tracked person,
+   and writes the annotated video to `--output`. Press `q` to stop early. Pass
+   `--no-display` on a headless machine or when batch processing.
+
+4. **Run the tests**:
+   ```bash
+   python -m pytest tests -q
+   ```
 
 ---
 
 ### Important Parameters
 
-- **`CONFIDENCE_THRESHOLD = 0.5`**: 
-  Minimum confidence for YOLO detections. Increase this value to reduce false positives.
-  
-- **`NMS_THRESHOLD = 0.3`**: 
-  Threshold for Non-Maximum Suppression to handle overlapping bounding boxes.
-  
-- **`REIDENTIFY_DELAY_FRAMES = 30`**: 
-  Maximum number of frames to wait before attempting re-identification of a lost person track.
+Every parameter below is a command line flag, so a run can be tuned without
+editing the script.
 
-- **DeepSORT Parameters**:
-  - `max_age=200`: Maximum number of frames an object can remain undetected before its track is removed.
-  - `n_init=5`: Minimum number of consecutive detections before an object is confirmed as being tracked.
-  - `nms_max_overlap=0.5`: Maximum allowed overlap for NMS in the DeepSORT tracker.
+- **`--conf 0.5`**:
+  Minimum YOLO detection confidence. Lower it to keep partially occluded people;
+  raise it to drop false positives.
+
+- **`--max-age 30`**:
+  Frames a track survives with no matching detection. Roughly one second at
+  30 fps. Keep it near one second: a track that coasts much longer will
+  re-attach to a different person walking through the same spot.
+
+- **`--n-init 3`**:
+  Consecutive detections before a track is confirmed and given an ID. Lower is
+  faster to label, higher rejects flickering false positives.
+
+- **`--nms-overlap 0.5`**:
+  Overlap allowed by DeepSORT's NMS pass.
+
+- **`--reid-threshold 0.35`**:
+  Maximum cosine distance between a new appearance and a stored identity for
+  them to count as the same person.
+
+- **`--reid-margin 0.05`**:
+  How much the best match must beat the runner-up. When two known people are
+  equally close, the tracker starts a new identity instead of guessing.
+
+- **`--reid-alpha 0.9`**:
+  Weight of the stored appearance when folding in a new sighting. A high value
+  keeps an identity stable through a single blurry or occluded frame.
+
+- **`--reid-max-age 900`**:
+  Frames an unclaimed identity stays in the gallery before it is forgotten.
+
+---
+
+### How Identity Is Kept Stable
+
+Three things decide whether a person keeps their ID:
+
+1. **The tracker sees the appearance features.** The OSNet vectors are passed
+   into DeepSORT's association step, so a crossing or a brief occlusion is
+   resolved on appearance as well as on motion.
+
+2. **A gallery remembers people who left.** Each confirmed track owns an
+   identity number. When that track dies and the person comes back, DeepSORT
+   starts a new track, and the new track is matched against the gallery and
+   inherits the original number.
+
+3. **Matches must be unambiguous.** A new track only inherits an identity if it
+   is within `--reid-threshold` *and* beats the next best candidate by
+   `--reid-margin`. Identity numbers are never reused, and an identity that is
+   already held by a live track can never be handed to a second one.
 
 ---
 
 ### Troubleshooting
 
 1. **ID Switching**:
-   If you notice frequent switching of person IDs, try adjusting the `max_age`, `n_init`, and `nms_max_overlap` parameters of the DeepSORT tracker to improve tracking consistency.
+   Lower `--reid-threshold` if two different people are being merged into one
+   ID; raise it if one person keeps getting a new ID. `--max-age` matters just
+   as much: a value far above one second of video lets a dead track survive long
+   enough to capture whoever walks into that spot next.
 
-2. **Overlapping Detections**:
-   If overlapping detections are an issue, increasing the `NMS_THRESHOLD` can help eliminate redundant bounding boxes.
+2. **Look-alike People Confused**:
+   Increase `--reid-margin` so the best gallery match has to win by a clear
+   margin before it is trusted.
 
-3. **Low FPS**:
-   If the processing speed is low, consider reducing the video resolution or switching to a faster model (e.g., a lighter version of YOLOv8).
+3. **Overlapping Detections**:
+   Lowering `--nms-overlap` removes redundant boxes more aggressively.
+
+4. **Low FPS**:
+   `--no-reid` skips OSNet entirely, and a smaller `--model` or a GPU
+   (`--device 0`) both help.
 
 ---
 
